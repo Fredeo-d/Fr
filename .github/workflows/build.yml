@@ -2,7 +2,7 @@ name: Build Frame Windows Mod
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, master]
   workflow_dispatch:
 
 jobs:
@@ -11,67 +11,92 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: win64
+          - platform: win64
             os: windows-latest
-            target: Win64
-          - name: android64
+          - platform: android64
             os: ubuntu-latest
-            target: Android64
-          - name: android32
+          - platform: android32
             os: ubuntu-latest
-            target: Android32
     runs-on: ${{ matrix.os }}
-    name: Build ${{ matrix.name }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Unpack project zip if present
+      - name: Unzip project if a zip archive was uploaded
+        shell: python
+        run: |
+          import zipfile, glob, os, shutil
+          zips = glob.glob("*.zip")
+          if zips:
+              with zipfile.ZipFile(zips[0]) as z:
+                  z.extractall("_proj")
+              src = "_proj"
+              # если внутри архива одна папка — поднимаем её содержимое на уровень выше
+              entries = os.listdir(src)
+              if len(entries) == 1 and os.path.isdir(os.path.join(src, entries[0])):
+                  src = os.path.join(src, entries[0])
+              for item in os.listdir(src):
+                  shutil.move(os.path.join(src, item), item)
+              shutil.rmtree("_proj", ignore_errors=True)
+          print(sorted(os.listdir(".")))
+
+      - name: Install Geode CLI (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $rel = Invoke-RestMethod https://api.github.com/repos/geode-sdk/cli/releases/latest
+          $asset = $rel.assets | Where-Object { $_.name -match "win" } | Select-Object -First 1
+          Invoke-WebRequest $asset.browser_download_url -OutFile cli.zip
+          Expand-Archive cli.zip -DestinationPath "$env:RUNNER_TEMP\geodecli" -Force
+          echo "$env:RUNNER_TEMP\geodecli" >> $env:GITHUB_PATH
+
+      - name: Install Geode CLI (Linux)
+        if: runner.os == 'Linux'
         shell: bash
         run: |
-          shopt -s nullglob
-          zips=( *.zip )
-          if [ ${#zips[@]} -gt 0 ]; then
-            echo "Found project archive: ${zips[0]}"
-            mkdir _proj
-            unzip -o "${zips[0]}" -d _proj > /dev/null
-            shopt -s dotglob
-            if [ $(ls _proj | wc -l) -eq 1 ] && [ -d "$(ls -d _proj/* | head -n 1)" ]; then
-              mv _proj/*/* .
-            else
-              mv _proj/* .
-            fi
-            rm -rf _proj
-          else
-            echo "No zip found, using repository as-is"
-          fi
-          echo "--- Project root ---"
-          ls -la
+          rel=$(curl -s https://api.github.com/repos/geode-sdk/cli/releases/latest)
+          url=$(echo "$rel" | grep -o '"browser_download_url": *"[^"]*linux[^"]*"' | head -1 | cut -d'"' -f4)
+          curl -L "$url" -o cli.zip
+          mkdir -p "$HOME/geodecli"
+          unzip -o cli.zip -d "$HOME/geodecli"
+          echo "$HOME/geodecli" >> $GITHUB_PATH
 
-      - name: Diagnose project
-        shell: bash
-        run: |
-          if [ ! -f mod.json ]; then
-            echo "::error::mod.json not found in project root"
-          else
-            echo "--- mod.json ---"
-            cat mod.json
-          fi
-          if [ ! -f CMakeLists.txt ]; then
-            echo "::error::CMakeLists.txt not found in project root"
-          else
-            echo "--- CMakeLists.txt (first 30 lines) ---"
-            head -n 30 CMakeLists.txt
-          fi
-
-      - name: Build
-        uses: geode-sdk/build-geode-mod@main
-        id: build
+      - name: Install Android NDK
+        if: runner.os == 'Linux'
+        id: ndk
+        uses: nttld/setup-ndk@v1
         with:
-          target: ${{ matrix.target }}
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure NDK env
+        if: runner.os == 'Linux'
+        shell: bash
+        run: echo "ANDROID_NDK_ROOT=${{ steps.ndk.outputs.path }}" >> $GITHUB_ENV
+
+      - name: Install Geode SDK
+        shell: bash
+        run: |
+          geode --version
+          geode sdk install nightly --ready
+          geode sdk setup --skip-cli-update
+
+      - name: Build (win64)
+        if: matrix.platform == 'win64'
+        shell: pwsh
+        run: geode build --platform win64
+
+      - name: Build (android)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: geode build --platform ${{ matrix.platform }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mod-${{ matrix.name }}
-          path: ${{ steps.build.outputs.build-output }}
+          name: mod-${{ matrix.platform }}
+          path: |
+            build/*.geode
+            **/*.geode
+          if-no-files-found: error
